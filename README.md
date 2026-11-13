@@ -5,7 +5,6 @@ One row of metrics per git repository.
 ## Requirements
 
 - Python 3.9+ and `git`
-- [`scc`](https://github.com/boyter/scc) on `PATH` (or set `SCC_BIN`)
 - [`jscpd`](https://github.com/kucherenko/jscpd) with Node, for the duplication ratio (a built-in estimate is used without it)
 - Private repos: set `GH_TOKEN` / `GITHUB_TOKEN`, `GITLAB_TOKEN` or `BITBUCKET_TOKEN`
 
@@ -29,13 +28,13 @@ A failing repo is recorded and never stops the batch.
 
 | Repo | Logical LOC (excludes blanks & comments) | Non-Authored LOC (auto-gen + vendored + deps) | Duplication Ratio (0.00-1.00) | Non-Merge Commit Count | Builds & Tests |
 |---|---|---|---|---|---|
-| lh2-tech/codebase-profiler | 13874 | 0 | 0.0188 | 69 | Build + Tests |
-| lh2-tech/repo-metrics | 2014 | 0 | 0.0074 | 8 | Build |
+| lh2-tech/codebase-profiler | 12245 | 0 | 0.0188 | 69 | Build + Tests |
+| lh2-tech/repo-metrics | 2454 | 0 | 0.0074 | 8 | Build |
 | octocat/Hello-World | 0 | 0 | 0.0 | 3 | Not available |
 | owner/missing-repo | | | | | FAILED: repository not found |
 
 `Builds & Tests` reads `Build` when the repo has a Dockerfile, `Build + Tests` when it also has test files, and `Not available` otherwise.
 
-Markdown, CSV, JSON, text and other data files are not counted in the LOC columns.
+The LOC columns count code files only (not Markdown, CSV, JSON and other data files), the same way codebase-profiler counts source lines. Test files are left out; add `--include-tests` to count them.
 
 `out/repo_analysis_v2.jsonl` has the same rows plus `status`, `error` and `seconds`.
