@@ -27,10 +27,13 @@ A failing repo is recorded and never stops the batch.
 
 | Repo | Logical LOC (excludes blanks & comments) | Non-Authored LOC (auto-gen + vendored + deps) | Duplication Ratio (0.00-1.00) | Non-Merge Commit Count | Builds & Tests |
 |---|---|---|---|---|---|
-| lh2-tech/codebase-profiler | 14221 | 1 | 0.0188 | 69 | Build + Test present |
-| lh2-tech/repo-metrics | 2240 | 0 | 0.0075 | 7 | Build + Test present |
+| lh2-tech/codebase-profiler | 13874 | 0 | 0.0188 | 69 | Build + Tests |
+| lh2-tech/repo-metrics | 2014 | 0 | 0.0074 | 8 | Build |
+| octocat/Hello-World | 0 | 0 | 0.0 | 3 | Not available |
 | owner/missing-repo | | | | | FAILED: repository not found |
 
-`Builds & Tests` reads `Build + Test present` when the repo has a Dockerfile and `Not verified` otherwise.
+`Builds & Tests` reads `Build` when the repo has a Dockerfile, `Build + Tests` when it also has test files, and `Not available` otherwise.
+
+Markdown, CSV, JSON, text and other data files are not counted in the LOC columns.
 
 `out/repo_analysis_v2.jsonl` has the same rows plus `status`, `error` and `seconds`.

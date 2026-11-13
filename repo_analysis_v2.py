@@ -15,9 +15,9 @@ Output, out/repo_analysis_v2.csv, one row per repo:
     Non-Authored LOC (auto-gen + vendored + deps)
     Duplication Ratio (0.00-1.00)
     Non-Merge Commit Count
-    Builds & Tests          "Build + Test present" if the repo has a Dockerfile,
-                            otherwise "Not verified"; a repo that could not be
-                            measured shows "FAILED: <reason>"
+    Builds & Tests          "Build" if the repo has a Dockerfile, "Build + Tests" if it
+                            also has test files, otherwise "Not available"; a repo
+                            that could not be measured shows "FAILED: <reason>"
 out/repo_analysis_v2.jsonl holds the same rows with status and error fields.
 Re-running skips repos already measured; --force measures them again.
 """
@@ -52,6 +52,15 @@ HEADER = [
 KEYS = ["repo", "logical_loc", "non_authored_loc", "duplication_ratio", "non_merge_commits", "builds_and_tests"]
 EXCLUDE_DIRS = ["vendor", "node_modules", "dist", "build", "generated", "migrations"]
 MIN_TOKENS, MIN_LINES, DUP_FILE_LIMIT = 50, 5, 8000
+# Languages scc reports as code that are really documentation or data; not counted.
+DATA_LANGUAGES = {
+    "JSON", "Plain Text", "XML", "Markdown", "CSV", "Text", "Properties File",
+    "SVG", "HTML", "CSS", "LESS", "Sass", "SCSS", "YAML", "TOML",
+    "Web Services Description Language",
+}
+TEST_DIR = re.compile(r"(^|/)(tests?|__tests__|specs?|testing)/", re.I)
+TEST_FILE = re.compile(r"(^|/)([^/]*(\.test|\.spec|_test|_spec)\.[A-Za-z0-9]+|test_[^/]*\.py|[^/]*(Test|Tests|IT)\.(java|kt|cs|php|swift|scala))$")
+VENDORED = re.compile(r"(^|/)(node_modules|vendor|site-packages|third_party|Pods)/")
 HOSTS = {"github": "github.com", "gitlab": "gitlab.com", "bitbucket": "bitbucket.org"}
 ALWAYS_SKIP_DIRS = {
     ".git", ".hg", ".svn", ".venv", "venv", "env", ".env", ".tox", ".nox",
@@ -267,12 +276,15 @@ def default_branch_of(repo: Path) -> str:
 # ── scc ──────────────────────────────────────────────────────────────────────
 
 def scc_code_total(scc_bin: str, repo: Path, timeout: int, extra: Sequence[str] = ()) -> int:
+    """scc Code lines (no blanks, no comments), leaving out documentation and data languages."""
     r = subprocess.run([scc_bin, "--format", "json", *extra, str(repo)],
                        capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout or "scc failed")[-400:])
     data = json.loads(r.stdout or "[]")
-    return sum(int(row.get("Code") or 0) for row in data) if isinstance(data, list) else 0
+    if not isinstance(data, list):
+        return 0
+    return sum(int(row.get("Code") or 0) for row in data if (row.get("Name") or "") not in DATA_LANGUAGES)
 
 
 def find_scc() -> Optional[str]:
@@ -508,6 +520,27 @@ def find_dockerfiles(repo: Path, limit: int = 50) -> List[str]:
     return found
 
 
+def has_tests(repo: Path) -> bool:
+    """Any tracked test file outside vendored folders."""
+    listing = run(["git", "ls-files", "-z"], repo, 300)
+    if listing.ok:
+        files = [f for f in listing.out.split("\0") if f]
+    else:
+        files = []
+        skip = {n.lower() for n in ALWAYS_SKIP_DIRS}
+        for root, dirs, names in os.walk(repo):
+            dirs[:] = [d for d in dirs if d.lower() not in skip]
+            files += [(Path(root) / n).relative_to(repo).as_posix() for n in names]
+    return any((TEST_DIR.search(f) or TEST_FILE.search(f)) and not VENDORED.search(f) for f in files)
+
+
+def builds_and_tests(repo: Path) -> str:
+    """Dockerfile -> Build; Dockerfile and tests -> Build + Tests; otherwise Not available."""
+    if not find_dockerfiles(repo):
+        return "Not available"
+    return "Build + Tests" if has_tests(repo) else "Build"
+
+
 # ── per repo ─────────────────────────────────────────────────────────────────
 
 def measure(spec: dict, scc_bin: str, jscpd_cmd: Optional[List[str]], args: argparse.Namespace) -> dict:
@@ -557,7 +590,7 @@ def measure(spec: dict, scc_bin: str, jscpd_cmd: Optional[List[str]], args: argp
         row["duplication_ratio"] = dup["duplication_ratio"]
 
         row["non_merge_commits"] = non_merge_commit_count(repo, branch, args.git_timeout)
-        row["builds_and_tests"] = "Build + Test present" if find_dockerfiles(repo) else "Not verified"
+        row["builds_and_tests"] = builds_and_tests(repo)
     except Exception as exc:  # noqa: BLE001 - a bad repo is recorded, never fatal
         row["status"], row["error"] = "error", " ".join(str(exc).split())[-300:]
         row["builds_and_tests"] = "FAILED: " + row["error"][:80]
