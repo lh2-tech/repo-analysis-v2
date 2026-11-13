@@ -570,27 +570,35 @@ def measure(spec: dict, scc_bin: str, jscpd_cmd: Optional[List[str]], args: argp
             branch = select_latest_branch(repo, default, local)
         branch = branch or default
 
-        logical = scc_code_total(scc_bin, repo, args.scc_timeout)
         authored_args = ["--no-gen", "--no-min-gen"]
         for d in EXCLUDE_DIRS:
             authored_args += ["--exclude-dir", d]
-        authored = scc_code_total(scc_bin, repo, args.scc_timeout, authored_args)
-        row["logical_loc"] = logical
-        row["non_authored_loc"] = max(logical - authored, 0)
 
-        dup: Dict[str, Any] = {}
-        if jscpd_cmd:
-            try:
-                dup = jscpd_ratio(jscpd_cmd, repo, scratch / "jscpd", EXCLUDE_DIRS, MIN_TOKENS, MIN_LINES,
-                                  args.jscpd_timeout)
-            except Exception:  # noqa: BLE001 - fall back rather than lose the repo
-                dup = {}
-        if not dup:
-            dup = builtin_dup_ratio(repo, EXCLUDE_DIRS, MIN_TOKENS, MIN_LINES, DUP_FILE_LIMIT)
-        row["duplication_ratio"] = dup["duplication_ratio"]
+        def duplication() -> float:
+            dup: Dict[str, Any] = {}
+            if jscpd_cmd:
+                try:
+                    dup = jscpd_ratio(jscpd_cmd, repo, scratch / "jscpd", EXCLUDE_DIRS, MIN_TOKENS, MIN_LINES,
+                                      args.jscpd_timeout)
+                except Exception:  # noqa: BLE001 - fall back rather than lose the repo
+                    dup = {}
+            if not dup:
+                dup = builtin_dup_ratio(repo, EXCLUDE_DIRS, MIN_TOKENS, MIN_LINES, DUP_FILE_LIMIT)
+            return dup["duplication_ratio"]
 
-        row["non_merge_commits"] = non_merge_commit_count(repo, branch, args.git_timeout)
-        row["builds_and_tests"] = builds_and_tests(repo)
+        # The five measurements only read the checkout, so run them side by side.
+        with ThreadPoolExecutor(max_workers=5) as steps:
+            f_logical = steps.submit(scc_code_total, scc_bin, repo, args.scc_timeout)
+            f_authored = steps.submit(scc_code_total, scc_bin, repo, args.scc_timeout, authored_args)
+            f_dup = steps.submit(duplication)
+            f_commits = steps.submit(non_merge_commit_count, repo, branch, args.git_timeout)
+            f_builds = steps.submit(builds_and_tests, repo)
+            logical = f_logical.result()
+            row["logical_loc"] = logical
+            row["non_authored_loc"] = max(logical - f_authored.result(), 0)
+            row["duplication_ratio"] = f_dup.result()
+            row["non_merge_commits"] = f_commits.result()
+            row["builds_and_tests"] = f_builds.result()
     except Exception as exc:  # noqa: BLE001 - a bad repo is recorded, never fatal
         row["status"], row["error"] = "error", " ".join(str(exc).split())[-300:]
         row["builds_and_tests"] = "FAILED: " + row["error"][:80]
@@ -604,7 +612,7 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Repo analysis v2: LOC, duplication, commits and Dockerfile check per repo.")
     ap.add_argument("--repos", required=True, help="repo list (txt/csv/json/jsonl)")
     ap.add_argument("--out", required=True, help="output directory")
-    ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--workers", type=int, default=4, help="repos measured at the same time")
     ap.add_argument("--default-platform", choices=list(HOSTS), default="github")
     ap.add_argument("--branch-mode", choices=["latest", "default"], default="latest",
                     help="latest: the branch with the newest commit; default: the platform default branch")

@@ -18,6 +18,8 @@ python3 repo_analysis_v2.py --repos repos.txt --out out/ --workers 4
 `repos.txt` takes one entry per line: `owner/repo`, a GitHub/GitLab/Bitbucket URL, an SSH URL or a local path.
 `.csv`, `.json` and `.jsonl` lists also work. Use `--default-platform gitlab` for bare `group/repo` lines.
 
+`--workers N` measures N repos at the same time (default 4); the measurements inside each repo also run side by side.
+
 Re-running the same command skips repos already measured; add `--force` to measure them again.
 A failing repo is recorded and never stops the batch.
 
