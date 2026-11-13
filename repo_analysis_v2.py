@@ -285,7 +285,7 @@ def default_branch_of(repo: Path) -> str:
         except RuntimeError:
             return ""
 
-# ── scc ──────────────────────────────────────────────────────────────────────
+# ── lines of code ────────────────────────────────────────────────────────────
 
 def count_lines(path: Path) -> int:
     try:
