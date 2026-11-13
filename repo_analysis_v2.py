@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Authored-source LOC for a list of git repos, on codebase-profiler's branch rule.
+"""repo-analysis v2: authored-source LOC for a list of git repos, on codebase-profiler's branch rule.
 
 Measured the way codebase-profiler does it (full clone, newest-commit remote
 branch with ties going to the default branch, scc on the checkout), then
@@ -18,7 +18,7 @@ primary_language and languages_breakdown describe the cleaned code.
 Local-path repos are measured as checked out; --local-latest-branch moves their
 HEAD to the newest branch like the profiler does (this edits the checkout).
 
-Output (under --out): authored_loc.csv, authored_loc.jsonl, and
+Output (under --out): repo_analysis_v2.csv, repo_analysis_v2.jsonl, and
 scc/<repo>.json (per-language code lines, raw and cleaned) for every repo. A failing repo gets
 status=error and never stops the batch. Existing results are skipped unless
 --force.
@@ -33,7 +33,7 @@ Tokens for private repos, from the environment: GH_TOKEN / GITHUB_TOKEN,
 GITLAB_TOKEN, BITBUCKET_TOKEN. They are passed to git through GIT_ASKPASS,
 never written to the clone's .git/config or to any output file.
 
-    python3 authored_loc.py --repos repos.txt --out out/ --workers 4
+    python3 repo_analysis_v2.py --repos repos.txt --out out/ --workers 4
 """
 from __future__ import annotations
 
@@ -267,7 +267,7 @@ def measure(spec: dict, scc_bin: str, out: Path, args: argparse.Namespace) -> di
             local = True
         else:
             local = False
-            work = Path(tempfile.mkdtemp(prefix="authored-loc-", dir=args.tmp_dir or None))
+            work = Path(tempfile.mkdtemp(prefix="repo-analysis-v2-", dir=args.tmp_dir or None))
             repo = work / "repo"
             env: dict = {}
             token, user = token_for(spec["platform"])
@@ -321,7 +321,7 @@ def main() -> int:
         return 2
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
-    jsonl = out / "authored_loc.jsonl"
+    jsonl = out / "repo_analysis_v2.jsonl"
     done: dict[str, dict] = {}
     if jsonl.exists() and not args.force:
         for line in jsonl.read_text(encoding="utf-8").splitlines():
@@ -345,12 +345,12 @@ def main() -> int:
                     fh.write(json.dumps(v) + "\n")
 
     ordered = [rows[s["name"]] for s in specs if s["name"] in rows]
-    with (out / "authored_loc.csv").open("w", newline="", encoding="utf-8") as fh:
+    with (out / "repo_analysis_v2.csv").open("w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=FIELDS)
         w.writeheader()
         w.writerows(ordered)
     bad = sum(1 for r in ordered if r["status"] != "ok")
-    log(f"done: {len(ordered) - bad} ok, {bad} failed -> {out / 'authored_loc.csv'}")
+    log(f"done: {len(ordered) - bad} ok, {bad} failed -> {out / 'repo_analysis_v2.csv'}")
     return 1 if bad else 0
 
 

@@ -1,4 +1,4 @@
-# authored-loc
+# repo-analysis-v2
 
 Authored-source lines of code for a list of git repos. The branch rule is
 [codebase-profiler](https://github.com/lh2-tech/codebase-profiler)'s; unlike the profiler, `loc` here excludes vendored, generated and data files. Companion to [repo-metrics](https://github.com/lh2-tech/repo-metrics): that tool
@@ -26,7 +26,7 @@ Python 3.9+ (standard library only), `git`, and [`scc`](https://github.com/boyte
 ## Usage
 
 ```bash
-python3 authored_loc.py --repos repos.txt --out out/ --workers 4
+python3 repo_analysis_v2.py --repos repos.txt --out out/ --workers 4
 ```
 
 `repos.txt`: one entry per line: `owner/repo`, a GitHub/GitLab/Bitbucket URL, an SSH URL or a local path
@@ -35,7 +35,7 @@ python3 authored_loc.py --repos repos.txt --out out/ --workers 4
 
 ## Output
 
-- `authored_loc.csv` / `.jsonl`: `repo, platform, measured_branch, default_branch, loc, raw_loc, files, primary_language, languages_breakdown, status, error, seconds`
+- `repo_analysis_v2.csv` / `.jsonl`: `repo, platform, measured_branch, default_branch, loc, raw_loc, files, primary_language, languages_breakdown, status, error, seconds`
 - `scc/<repo>.json`: per-language code lines (raw and cleaned) for each repo
 
 Re-runs skip repos already measured (`--force` to redo). A failing repo is recorded with `status=error` and never stops the batch.
