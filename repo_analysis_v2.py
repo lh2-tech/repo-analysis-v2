@@ -6,8 +6,8 @@ Usage:
 
 repos.txt, one per line: owner/repo, a GitHub/GitLab/Bitbucket URL, an SSH URL or a
 local path (.csv, .json and .jsonl lists work too). Private repos: set GH_TOKEN /
-GITHUB_TOKEN, GITLAB_TOKEN or BITBUCKET_TOKEN. Needs git; duplication uses jscpd when
-it is on PATH.
+GITHUB_TOKEN, GITLAB_TOKEN or BITBUCKET_TOKEN. Needs git and scc; duplication uses
+jscpd when it is on PATH.
 
 Output, out/repo_analysis_v2.csv, one row per repo:
     Repo
@@ -54,6 +54,7 @@ EXCLUDE_DIRS = ["vendor", "node_modules", "dist", "build", "generated", "migrati
 MIN_TOKENS, MIN_LINES, DUP_FILE_LIMIT = 50, 5, 8000
 # Source-LOC rules, taken from codebase-profiler: only these extensions are counted,
 # these folders are never entered, and files in test folders / with test names are not "source".
+# Lines are scc Code lines, so blanks and comments are left out.
 CODE_LOC_EXTENSIONS = {
     ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rs", ".rb", ".php",
     ".cs", ".swift", ".kt", ".scala", ".vue", ".svelte",
@@ -66,10 +67,7 @@ SKIP_WALK_DIRS = {
     "target", "bin", "obj", "packages",
 }
 TEST_DIR_HINTS = ("test", "tests", "spec", "specs", "__tests__")
-TEST_NAME_ENDINGS = (
-    "_test.py", "_test.go", "_test.rb", ".spec.ts", ".spec.tsx", ".spec.js", ".spec.jsx",
-    ".test.ts", ".test.tsx", ".test.js", ".test.jsx", "tests.cs", "test.cs", "test.java",
-)
+TEST_NAME_RE = r"(?i)(^test_.*|_test\.(py|go|rb)|\.(spec|test)\.(tsx?|jsx?)|tests?\.cs|test\.java)$"
 TEST_DIR = re.compile(r"(^|/)(tests?|__tests__|specs?|testing)/", re.I)
 TEST_FILE = re.compile(r"(^|/)([^/]*(\.test|\.spec|_test|_spec)\.[A-Za-z0-9]+|test_[^/]*\.py|[^/]*(Test|Tests|IT)\.(java|kt|cs|php|swift|scala))$")
 VENDORED = re.compile(r"(^|/)(node_modules|vendor|site-packages|third_party|Pods)/")
@@ -287,42 +285,46 @@ def default_branch_of(repo: Path) -> str:
 
 # ── lines of code ────────────────────────────────────────────────────────────
 
-def count_lines(path: Path) -> int:
-    try:
-        with path.open("rb") as fh:
-            return sum(1 for _ in fh)
-    except OSError:
-        return 0
+def scc_code_total(scc_bin: str, repo: Path, timeout: int, extra: Sequence[str] = ()) -> int:
+    """scc Code lines (no blanks, no comments) over the code files codebase-profiler counts."""
+    cmd = [scc_bin, "--format", "json", "--no-gitignore", "--no-ignore",
+           "--include-ext", ",".join(sorted(e.lstrip(".") for e in CODE_LOC_EXTENSIONS))]
+    for d in sorted(SKIP_WALK_DIRS):
+        cmd += ["--exclude-dir", d]
+    cmd += list(extra) + [str(repo)]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout or "scc failed")[-400:])
+    data = json.loads(r.stdout or "[]")
+    return sum(int(row.get("Code") or 0) for row in data) if isinstance(data, list) else 0
 
 
-def is_test_path(rel: str) -> bool:
-    parts = rel.lower().replace("\\", "/").split("/")
-    name = parts[-1]
-    return (any(part in TEST_DIR_HINTS for part in parts) or name.startswith("test_")
-            or name.endswith(TEST_NAME_ENDINGS))
+def source_loc(scc_bin: str, repo: Path, include_tests: bool, timeout: int) -> Tuple[int, int]:
+    """(source lines, of which non-authored): code lines, tests left out unless asked.
 
-
-def source_loc(repo: Path, include_tests: bool) -> Tuple[int, int]:
-    """(source lines, of which non-authored) over code files, as codebase-profiler counts them.
-
-    Non-authored = auto-generated files plus anything under the EXCLUDE_DIRS that the
+    Non-authored = auto-generated or minified files, plus anything under the EXCLUDE_DIRS the
     walk does not already skip (generated, migrations).
     """
-    total = non_authored = 0
-    for root, dirs, files in os.walk(repo):
-        dirs[:] = [d for d in dirs if d not in SKIP_WALK_DIRS]
-        for name in files:
-            path = Path(root) / name
-            if path.suffix.lower() not in CODE_LOC_EXTENSIONS:
-                continue
-            rel = path.relative_to(repo).as_posix()
-            if not include_tests and is_test_path(rel):
-                continue
-            lines = count_lines(path)
-            total += lines
-            if set(rel.split("/")[:-1]) & set(EXCLUDE_DIRS) or is_autogen(path, rel):
-                non_authored += lines
-    return total, non_authored
+    extra: List[str] = []
+    if not include_tests:
+        for d in TEST_DIR_HINTS:
+            for name in {d, d.capitalize()}:
+                extra += ["--exclude-dir", name]
+        extra += ["--not-match", TEST_NAME_RE]
+    total = scc_code_total(scc_bin, repo, timeout, extra)
+    authored_args = extra + ["--no-gen", "--no-min-gen"]
+    for d in EXCLUDE_DIRS:
+        if d not in SKIP_WALK_DIRS:
+            authored_args += ["--exclude-dir", d]
+    authored = scc_code_total(scc_bin, repo, timeout, authored_args)
+    return total, max(total - authored, 0)
+
+
+def find_scc() -> Optional[str]:
+    explicit = os.environ.get("SCC_BIN")
+    if explicit and Path(explicit).is_file():
+        return explicit
+    return shutil.which("scc")
 
 
 # ── duplication ──────────────────────────────────────────────────────────────
@@ -574,7 +576,7 @@ def builds_and_tests(repo: Path) -> str:
 
 # ── per repo ─────────────────────────────────────────────────────────────────
 
-def measure(spec: dict, jscpd_cmd: Optional[List[str]], args: argparse.Namespace) -> dict:
+def measure(spec: dict, scc_bin: str, jscpd_cmd: Optional[List[str]], args: argparse.Namespace) -> dict:
     t0 = time.time()
     row: Dict[str, Any] = {k: "" for k in KEYS}
     row.update(repo=spec["name"], status="ok", error="")
@@ -615,7 +617,7 @@ def measure(spec: dict, jscpd_cmd: Optional[List[str]], args: argparse.Namespace
 
         # The five measurements only read the checkout, so run them side by side.
         with ThreadPoolExecutor(max_workers=5) as steps:
-            f_loc = steps.submit(source_loc, repo, args.include_tests)
+            f_loc = steps.submit(source_loc, scc_bin, repo, args.include_tests, args.scc_timeout)
             f_dup = steps.submit(duplication)
             f_commits = steps.submit(non_merge_commit_count, repo, branch, args.git_timeout)
             f_builds = steps.submit(builds_and_tests, repo)
@@ -643,6 +645,7 @@ def main() -> int:
     ap.add_argument("--local-latest-branch", action="store_true",
                     help="also move HEAD of local-path repos to the newest-commit branch (edits that checkout)")
     ap.add_argument("--no-jscpd", action="store_true", help="skip jscpd and use the built-in duplication estimate")
+    ap.add_argument("--scc-timeout", type=int, default=600)
     ap.add_argument("--include-tests", action="store_true", help="also count test files in the LOC columns")
     ap.add_argument("--clone-timeout", type=int, default=3600)
     ap.add_argument("--jscpd-timeout", type=int, default=1800)
@@ -651,6 +654,10 @@ def main() -> int:
     ap.add_argument("--force", action="store_true", help="re-measure repos already in the output")
     args = ap.parse_args()
 
+    scc_bin = find_scc()
+    if not scc_bin:
+        print("ERROR: scc not found. Install it (https://github.com/boyter/scc) or set SCC_BIN.", file=sys.stderr)
+        return 2
     jscpd_cmd = None if args.no_jscpd else find_jscpd()[0]
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
@@ -665,11 +672,11 @@ def main() -> int:
     specs = read_specs(Path(args.repos), args.default_platform)
     todo = [s for s in specs if s["name"] not in done]
     log(f"{len(specs)} repos, {len(done)} already done, {len(todo)} to measure; "
-        f"duplication={'jscpd' if jscpd_cmd else 'built-in'}")
+        f"scc={scc_bin} duplication={'jscpd' if jscpd_cmd else 'built-in'}")
 
     rows = dict(done)
     with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
-        futs = {pool.submit(measure, s, jscpd_cmd, args): s for s in todo}
+        futs = {pool.submit(measure, s, scc_bin, jscpd_cmd, args): s for s in todo}
         for fut in as_completed(futs):
             r = fut.result()
             rows[r["repo"]] = r
