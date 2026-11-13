@@ -12,21 +12,22 @@ cleaned so that only authored source code is counted:
   * data / markup languages: JSON, XML, YAML, TOML, CSV, Markdown, Plain Text,
     HTML, CSS, SCSS/Sass/LESS, SVG, properties files, WSDL are dropped
 
-Columns, from widest to narrowest:
+Output columns:
+  repo, logical_loc, non_authored_loc, authored_loc, build_test_status,
+  status, error, seconds
+
   logical_loc       untouched scc Code total (the profiler's own figure)
   authored_loc      logical_loc minus vendored dirs and generated/minified files
   non_authored_loc  logical_loc - authored_loc
-  loc               authored_loc minus data/markup languages (code only)
-primary_language and languages_breakdown describe `loc`.
+  build_test_status "Builds + test suite passes" / "Builds only" / "Not verified"
+                    (same detection as repo-metrics). The default --build-check
+                    detect only identifies the build, so it stays "Not verified";
+                    --build-check docker really builds and runs the tests in a
+                    container; none leaves it blank.
 
-Build + test (same detection as repo-metrics): build_system, build_command,
-test_command, runtime_version, ci_runs_tests, dockerfile_present and
-build_test_status ("Builds + test suite passes" / "Builds only" / "Not
-verified"). The default --build-check detect only identifies the build, so the
-status stays "Not verified"; --build-check docker really builds and runs tests
-in a container.
-Local-path repos are measured as checked out; --local-latest-branch moves their
-HEAD to the newest branch like the profiler does (this edits the checkout).
+Measured internally but not written: platform, branch, code-only loc, file count,
+languages, build command/system/runtime. They drive branch choice and build-plan
+selection; the scc/<repo>.json file keeps the per-language detail.
 
 Output (under --out): repo_analysis_v2.csv, repo_analysis_v2.jsonl, and
 scc/<repo>.json (per-language code lines, raw and cleaned) for every repo. A failing repo gets
@@ -63,12 +64,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+# Columns written to the CSV/JSONL. Everything else below is measured internally
+# (it drives branch choice and build-plan selection) but not part of the output.
 FIELDS = [
-    "repo", "platform", "measured_branch", "default_branch", "logical_loc", "non_authored_loc", "authored_loc", "loc", "files",
-    "primary_language", "languages_breakdown",
-    "build_test_status", "build_system", "build_systems_detected", "build_command", "test_command",
+    "repo", "logical_loc", "non_authored_loc", "authored_loc",
+    "build_test_status", "status", "error", "seconds",
+]
+_INTERNAL = [
+    "platform", "measured_branch", "default_branch", "loc", "files", "primary_language",
+    "languages_breakdown", "build_system", "build_systems_detected", "build_command", "test_command",
     "runtime_version", "runtime_version_source", "ci_runs_tests", "dockerfile_present", "dockerfile_count",
-    "status", "error", "seconds",
 ]
 HOSTS = {"github": "github.com", "gitlab": "gitlab.com", "bitbucket": "bitbucket.org"}
 EXCLUDE_DIRS = ["vendor", "node_modules", "dist", "build", "generated", "migrations"]
@@ -647,7 +652,7 @@ def safe_name(name: str) -> str:
 
 def measure(spec: dict, scc_bin: str, out: Path, args: argparse.Namespace) -> dict:
     t0 = time.time()
-    row = {k: "" for k in FIELDS}
+    row = {k: "" for k in FIELDS + _INTERNAL}
     row.update(repo=spec["name"], platform=spec["platform"], status="ok")
     work: Optional[Path] = None
     try:
@@ -745,14 +750,14 @@ def main() -> int:
         for fut in as_completed(futs):
             r = fut.result()
             rows[r["repo"]] = r
-            log(f"{r['status'].upper():5} {r['repo']} loc={r['loc']} branch={r['measured_branch']} ({r['seconds']}s) {r['error']}")
+            log(f"{r['status'].upper():5} {r['repo']} authored_loc={r['authored_loc']} build={r['build_test_status'] or '-'} ({r['seconds']}s) {r['error']}")
             with jsonl.open("w", encoding="utf-8") as fh:  # rewrite so a rerun never duplicates rows
                 for v in rows.values():
-                    fh.write(json.dumps(v) + "\n")
+                    fh.write(json.dumps({k: v.get(k, "") for k in FIELDS}) + "\n")
 
     ordered = [rows[s["name"]] for s in specs if s["name"] in rows]
     with (out / "repo_analysis_v2.csv").open("w", newline="", encoding="utf-8") as fh:
-        w = csv.DictWriter(fh, fieldnames=FIELDS)
+        w = csv.DictWriter(fh, fieldnames=FIELDS, extrasaction="ignore")
         w.writeheader()
         w.writerows(ordered)
     bad = sum(1 for r in ordered if r["status"] != "ok")

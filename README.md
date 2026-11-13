@@ -13,26 +13,21 @@ produces a due-diligence scorecard; this one produces the LOC figures and build/
    - vendored directories are skipped: `vendor`, `node_modules`, `dist`, `build`, `generated`, `migrations`;
    - generated and minified files are skipped (`--no-gen --no-min-gen`);
    - data / markup languages are dropped: JSON, XML, YAML, TOML, CSV, Markdown, Plain Text, HTML, CSS, SCSS/Sass/LESS, SVG, properties files, WSDL.
-4. The columns, widest to narrowest:
+4. The LOC columns:
 
    | Column | Meaning |
    |---|---|
    | `logical_loc` | untouched scc Code total (the profiler's own figure) |
    | `authored_loc` | `logical_loc` minus vendored dirs and generated/minified files |
    | `non_authored_loc` | `logical_loc - authored_loc` |
-   | `loc` | `authored_loc` minus the data/markup languages: code only |
-
-   `primary_language` and `languages_breakdown` describe `loc`.
 
 ## Build and test
 
-Same detection as [repo-metrics](https://github.com/lh2-tech/repo-metrics): `build_system`, `build_systems_detected`,
-`build_command`, `test_command`, `runtime_version`, `runtime_version_source`, `ci_runs_tests`, `dockerfile_present`,
-`dockerfile_count` and `build_test_status`.
+`build_test_status` uses the same detection as [repo-metrics](https://github.com/lh2-tech/repo-metrics).
 
-- `--build-check detect` (default) identifies the build statically, so `build_test_status` stays `Not verified`.
+- `--build-check detect` (default) identifies the build statically, so the status stays `Not verified`.
 - `--build-check docker` really builds and runs the tests in a language-matched container (needs a Docker daemon; falls back to `detect` without one) and reports `Builds + test suite passes`, `Builds only` or `Not verified`.
-- `--build-check none` skips it.
+- `--build-check none` skips it and leaves the column blank.
 
 `--branch-mode default` measures the platform default branch instead.
 Local-path repos are measured as checked out; `--local-latest-branch` moves their HEAD to the newest branch (this edits the checkout).
@@ -53,7 +48,7 @@ python3 repo_analysis_v2.py --repos repos.txt --out out/ --workers 4
 
 ## Output
 
-- `repo_analysis_v2.csv` / `.jsonl`: `repo, platform, measured_branch, default_branch, logical_loc, non_authored_loc, authored_loc, loc, files, primary_language, languages_breakdown`, the build/test columns above, then `status, error, seconds`
+- `repo_analysis_v2.csv` / `.jsonl`: `repo, logical_loc, non_authored_loc, authored_loc, build_test_status, status, error, seconds`
 - `scc/<repo>.json`: per-language code lines (raw, authored and cleaned) for each repo
 
 Re-runs skip repos already measured (`--force` to redo). A failing repo is recorded with `status=error` and never stops the batch.
