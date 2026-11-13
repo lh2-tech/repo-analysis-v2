@@ -12,9 +12,19 @@ cleaned so that only authored source code is counted:
   * data / markup languages: JSON, XML, YAML, TOML, CSV, Markdown, Plain Text,
     HTML, CSS, SCSS/Sass/LESS, SVG, properties files, WSDL are dropped
 
-`loc` is that cleaned figure. `raw_loc` is the untouched profiler figure (sum
-of scc's Code column over everything) so the two can be compared.
-primary_language and languages_breakdown describe the cleaned code.
+Columns, from widest to narrowest:
+  logical_loc       untouched scc Code total (the profiler's own figure)
+  authored_loc      logical_loc minus vendored dirs and generated/minified files
+  non_authored_loc  logical_loc - authored_loc
+  loc               authored_loc minus data/markup languages (code only)
+primary_language and languages_breakdown describe `loc`.
+
+Build + test (same detection as repo-metrics): build_system, build_command,
+test_command, runtime_version, ci_runs_tests, dockerfile_present and
+build_test_status ("Builds + test suite passes" / "Builds only" / "Not
+verified"). The default --build-check detect only identifies the build, so the
+status stays "Not verified"; --build-check docker really builds and runs tests
+in a container.
 Local-path repos are measured as checked out; --local-latest-branch moves their
 HEAD to the newest branch like the profiler does (this edits the checkout).
 
@@ -51,11 +61,14 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 FIELDS = [
-    "repo", "platform", "measured_branch", "default_branch", "loc", "raw_loc", "files",
-    "primary_language", "languages_breakdown", "status", "error", "seconds",
+    "repo", "platform", "measured_branch", "default_branch", "logical_loc", "non_authored_loc", "authored_loc", "loc", "files",
+    "primary_language", "languages_breakdown",
+    "build_test_status", "build_system", "build_systems_detected", "build_command", "test_command",
+    "runtime_version", "runtime_version_source", "ci_runs_tests", "dockerfile_present", "dockerfile_count",
+    "status", "error", "seconds",
 ]
 HOSTS = {"github": "github.com", "gitlab": "gitlab.com", "bitbucket": "bitbucket.org"}
 EXCLUDE_DIRS = ["vendor", "node_modules", "dist", "build", "generated", "migrations"]
@@ -224,14 +237,18 @@ def run_scc(scc_bin: str, repo: Path, timeout: int, extra: tuple = ()) -> tuple[
     return by_lang, files_by_lang
 
 
-def clean_scc(scc_bin: str, repo: Path, timeout: int) -> tuple[dict[str, int], int]:
-    """Authored source only: no vendored dirs, generated/minified files or data languages."""
+def clean_scc(scc_bin: str, repo: Path, timeout: int) -> tuple[dict[str, int], dict[str, int], int]:
+    """Return (authored by language, cleaned code by language, cleaned file count).
+
+    Authored = no vendored dirs and no generated/minified files (data languages still in).
+    Cleaned  = authored minus the data/markup languages.
+    """
     extra = ["--no-gen", "--no-min-gen"]
     for d in EXCLUDE_DIRS:
         extra += ["--exclude-dir", d]
     by_lang, files_by_lang = run_scc(scc_bin, repo, timeout, tuple(extra))
     code = {k: v for k, v in by_lang.items() if k not in DATA_LANGUAGES and v > 0}
-    return code, sum(files_by_lang.get(k, 0) for k in code)
+    return by_lang, code, sum(files_by_lang.get(k, 0) for k in code)
 
 
 def languages_breakdown(by_language: dict[str, int]) -> tuple[str, str]:
@@ -248,6 +265,378 @@ def find_scc() -> Optional[str]:
     if explicit and Path(explicit).is_file():
         return explicit
     return shutil.which("scc")
+
+
+ALWAYS_SKIP_DIRS = {
+    ".git", ".hg", ".svn", ".venv", "venv", "env", ".env", ".tox", ".nox",
+    "__pycache__", ".mypy_cache", ".pytest_cache", ".ruff_cache", ".gradle",
+    ".terraform", ".idea", ".vscode", "site-packages", ".cache",
+}
+
+# ── build and test (same detection as repo-metrics) ─────────────────────────
+
+class CmdResult:
+    __slots__ = ("code", "out", "err", "timed_out", "cmd")
+
+    def __init__(self, cmd: Sequence[str], code: int, out: str, err: str, timed_out: bool):
+        self.cmd = list(cmd)
+        self.code = code
+        self.out = out
+        self.err = err
+        self.timed_out = timed_out
+
+    @property
+    def ok(self) -> bool:
+        return self.code == 0 and not self.timed_out
+
+    def tail(self, n: int = 800) -> str:
+        return ((self.err or self.out) or "").strip()[-n:]
+
+
+def run(cmd: Sequence[str], cwd: Optional[Path] = None, timeout: int = 900,
+        env: Optional[Dict[str, str]] = None) -> CmdResult:
+    try:
+        proc = subprocess.run(
+            list(cmd),
+            cwd=str(cwd) if cwd else None,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
+        )
+        return CmdResult(cmd, proc.returncode, proc.stdout or "", proc.stderr or "", False)
+    except subprocess.TimeoutExpired as exc:
+        out = exc.stdout.decode() if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        err = exc.stderr.decode() if isinstance(exc.stderr, bytes) else (exc.stderr or "")
+        return CmdResult(cmd, 124, out, err + f"\n[timeout after {timeout}s]", True)
+    except FileNotFoundError as exc:
+        return CmdResult(cmd, 127, "", str(exc), False)
+
+
+
+def docker_available() -> bool:
+    if not shutil.which("docker"):
+        return False
+    return run(["docker", "info", "--format", "{{.ServerVersion}}"], timeout=20).ok
+
+
+
+
+
+
+class BuildPlan:
+    __slots__ = ("system", "build_cmd", "test_cmd", "runtime", "runtime_source", "image")
+
+    def __init__(self, system: str, build_cmd: str, test_cmd: str,
+                 runtime: str, runtime_source: str, image: str):
+        self.system = system
+        self.build_cmd = build_cmd
+        self.test_cmd = test_cmd
+        self.runtime = runtime
+        self.runtime_source = runtime_source
+        self.image = image
+
+
+def _read(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def _json(path: Path) -> Dict[str, Any]:
+    try:
+        data = json.loads(_read(path) or "{}")
+        return data if isinstance(data, dict) else {}
+    except json.JSONDecodeError:
+        return {}
+
+
+# Which build system belongs to which source language, so a PHP app carrying a
+# package.json for its frontend assets is not reported as a Node project.
+LANGUAGE_BUILD_SYSTEMS = {
+    "PHP": "php",
+    "JavaScript": "node", "TypeScript": "node", "Vue": "node", "JSX": "node", "TSX": "node",
+    "Python": "python",
+    "Go": "go",
+    "Java": "maven", "Kotlin": "gradle",
+    "Ruby": "ruby",
+    "C#": "dotnet",
+    "Rust": "cargo",
+}
+
+
+def detect_build_plans(repo: Path) -> List[BuildPlan]:
+    """Every build system present, most specific first."""
+    plans: List[BuildPlan] = []
+    for detector in (
+        _plan_node, _plan_php, _plan_python, _plan_go, _plan_maven, _plan_gradle,
+        _plan_ruby, _plan_cargo, _plan_dotnet, _plan_make, _plan_dockerfile,
+    ):
+        try:
+            plan = detector(repo)
+        except Exception:  # noqa: BLE001 - a bad manifest must not kill the repo
+            plan = None
+        if plan:
+            plans.append(plan)
+    return plans
+
+
+def detect_build_plan(repo: Path, primary_language: str = "") -> Optional[BuildPlan]:
+    """Pick the build system matching the repo's primary source language.
+
+    Falls back to detection order when the primary language has no build system
+    or that system is not present in the repo.
+    """
+    plans = detect_build_plans(repo)
+    if not plans:
+        return None
+    preferred = LANGUAGE_BUILD_SYSTEMS.get(primary_language)
+    if preferred:
+        for plan in plans:
+            if plan.system == preferred:
+                return plan
+    return plans[0]
+
+
+def _plan_node(repo: Path) -> Optional[BuildPlan]:
+    pkg = repo / "package.json"
+    if pkg.is_file():
+        data = _json(pkg)
+        scripts = data.get("scripts") or {}
+        runtime, source = "", ""
+        nvmrc = repo / ".nvmrc"
+        if nvmrc.is_file():
+            runtime, source = _read(nvmrc).strip().lstrip("v"), ".nvmrc"
+        elif (data.get("engines") or {}).get("node"):
+            runtime, source = str(data["engines"]["node"]).strip(), "package.json engines.node"
+        install = "npm ci" if (repo / "package-lock.json").is_file() else "npm install"
+        if (repo / "yarn.lock").is_file():
+            install = "yarn install --frozen-lockfile"
+        elif (repo / "pnpm-lock.yaml").is_file():
+            install = "pnpm install --frozen-lockfile"
+        build = f"{install} && npm run build" if "build" in scripts else install
+        test = "npm test" if "test" in scripts else ""
+        major = re.sub(r"[^0-9.].*$", "", runtime).split(".")[0] or "20"
+        return BuildPlan("node", build, test, runtime, source, f"node:{major}")
+    return None
+
+
+def _plan_go(repo: Path) -> Optional[BuildPlan]:
+    if (repo / "go.mod").is_file():
+        version = ""
+        match = re.search(r"^go\s+([0-9.]+)", _read(repo / "go.mod"), re.M)
+        if match:
+            version = match.group(1)
+        return BuildPlan("go", "go build ./...", "go test ./...", version, "go.mod",
+                         f"golang:{version or '1.22'}")
+    return None
+
+
+def _plan_maven(repo: Path) -> Optional[BuildPlan]:
+    if (repo / "pom.xml").is_file():
+        version = ""
+        text = _read(repo / "pom.xml")
+        match = re.search(r"<maven\.compiler\.(?:release|source|target)>([^<]+)<", text)
+        if match:
+            version = match.group(1).strip()
+        return BuildPlan("maven", "mvn -B -DskipTests package", "mvn -B test", version,
+                         "pom.xml maven.compiler", f"maven:3-eclipse-temurin-{version or '17'}")
+    return None
+
+
+def _plan_gradle(repo: Path) -> Optional[BuildPlan]:
+    if (repo / "build.gradle").is_file() or (repo / "build.gradle.kts").is_file():
+        version = ""
+        match = re.search(r"sourceCompatibility\s*=\s*['\"]?([0-9._]+)", _read(repo / "build.gradle"))
+        if match:
+            version = match.group(1)
+        return BuildPlan("gradle", "gradle build -x test", "gradle test", version,
+                         "build.gradle sourceCompatibility", f"gradle:jdk{(version or '17').split('.')[-1]}")
+    return None
+
+
+def _plan_python(repo: Path) -> Optional[BuildPlan]:
+    if (repo / "pyproject.toml").is_file() or (repo / "requirements.txt").is_file() or (repo / "setup.py").is_file():
+        version, source = "", ""
+        pyver = repo / ".python-version"
+        if pyver.is_file():
+            version, source = _read(pyver).strip(), ".python-version"
+        else:
+            match = re.search(r'requires-python\s*=\s*["\']([^"\']+)', _read(repo / "pyproject.toml"))
+            if match:
+                version, source = match.group(1).strip(), "pyproject.toml requires-python"
+        install = "pip install -r requirements.txt" if (repo / "requirements.txt").is_file() else "pip install ."
+        major = re.sub(r"[^0-9.]", "", version)[:4].rstrip(".") or "3.11"
+        return BuildPlan("python", install, "pytest -q", version, source, f"python:{major}")
+    return None
+
+
+def _plan_ruby(repo: Path) -> Optional[BuildPlan]:
+    if (repo / "Gemfile").is_file():
+        version, source = "", ""
+        ruby_version = repo / ".ruby-version"
+        if ruby_version.is_file():
+            version, source = _read(ruby_version).strip(), ".ruby-version"
+        else:
+            match = re.search(r"ruby\s+['\"]([^'\"]+)", _read(repo / "Gemfile"))
+            if match:
+                version, source = match.group(1), "Gemfile ruby"
+        test = "bundle exec rspec" if (repo / "spec").is_dir() else "bundle exec rake test"
+        return BuildPlan("ruby", "bundle install", test, version, source,
+                         f"ruby:{version or '3.2'}")
+    return None
+
+
+def _plan_php(repo: Path) -> Optional[BuildPlan]:
+    if (repo / "composer.json").is_file():
+        data = _json(repo / "composer.json")
+        version = str((data.get("require") or {}).get("php") or "").strip()
+        return BuildPlan("php", "composer install --no-interaction --no-progress",
+                         "vendor/bin/phpunit", version, "composer.json require.php",
+                         "composer:2")
+    return None
+
+
+def _plan_cargo(repo: Path) -> Optional[BuildPlan]:
+    if (repo / "Cargo.toml").is_file():
+        match = re.search(r'rust-version\s*=\s*["\']([^"\']+)', _read(repo / "Cargo.toml"))
+        version = match.group(1) if match else ""
+        return BuildPlan("cargo", "cargo build --locked", "cargo test", version,
+                         "Cargo.toml rust-version", f"rust:{version or '1'}")
+    return None
+
+
+def _plan_dotnet(repo: Path) -> Optional[BuildPlan]:
+    csproj = list(repo.glob("*.csproj")) + list(repo.glob("**/*.csproj"))[:1]
+    if csproj or (repo / "global.json").is_file():
+        version = str((_json(repo / "global.json").get("sdk") or {}).get("version") or "")
+        major = version.split(".")[0] or "8.0"
+        return BuildPlan("dotnet", "dotnet build -c Release", "dotnet test", version,
+                         "global.json sdk.version", f"mcr.microsoft.com/dotnet/sdk:{major}")
+    return None
+
+
+def _plan_make(repo: Path) -> Optional[BuildPlan]:
+    if (repo / "Makefile").is_file():
+        text = _read(repo / "Makefile")
+        return BuildPlan("make", "make", "make test" if re.search(r"^test:", text, re.M) else "",
+                         "", "", "")
+    return None
+
+
+def _plan_dockerfile(repo: Path) -> Optional[BuildPlan]:
+    if (repo / "Dockerfile").is_file():
+        return BuildPlan("docker", "docker build .", "", "", "Dockerfile FROM", "")
+    return None
+
+
+def ci_runs_tests(repo: Path) -> bool:
+    candidates: List[Path] = []
+    workflows = repo / ".github/workflows"
+    if workflows.is_dir():
+        candidates += [p for p in workflows.iterdir() if p.suffix in {".yml", ".yaml"}]
+    for name in (".gitlab-ci.yml", "Jenkinsfile", ".circleci/config.yml", "azure-pipelines.yml"):
+        path = repo / name
+        if path.is_file():
+            candidates.append(path)
+    pattern = re.compile(r"\b(npm test|yarn test|pytest|go test|mvn .*test|gradle test|rspec|phpunit|dotnet test|cargo test|jest|tox|make test)\b", re.I)
+    return any(pattern.search(_read(path)) for path in candidates)
+
+
+def docker_build_test(repo: Path, plan: BuildPlan, timeout: int) -> Dict[str, Any]:
+    """Attempt a real build and test run inside a language-matched container."""
+    if not plan.image:
+        if plan.system == "docker":
+            result = run(["docker", "build", "-q", "."], repo, timeout)
+            return {
+                "build_test_status": "Builds only" if result.ok else "Not verified",
+                "build_ok": result.ok,
+                "test_ok": "",
+                "build_log_tail": result.tail(600),
+            }
+        return {"build_test_status": "Not verified", "build_ok": "", "test_ok": "",
+                "build_log_tail": "no container recipe for this build system"}
+
+    mount = f"{repo}:/src"
+    base = ["docker", "run", "--rm", "-v", mount, "-w", "/src", plan.image, "sh", "-c"]
+
+    build = run(base + [plan.build_cmd], timeout=timeout)
+    if not build.ok:
+        return {"build_test_status": "Not verified", "build_ok": False, "test_ok": "",
+                "build_log_tail": build.tail(600)}
+    if not plan.test_cmd:
+        return {"build_test_status": "Builds only", "build_ok": True, "test_ok": "",
+                "build_log_tail": "no test command detected"}
+
+    test = run(base + [f"{plan.build_cmd} && {plan.test_cmd}"], timeout=timeout)
+    return {
+        "build_test_status": "Builds + test suite passes" if test.ok else "Builds only",
+        "build_ok": True,
+        "test_ok": test.ok,
+        "build_log_tail": test.tail(600),
+    }
+
+
+def find_dockerfiles(repo: Path, limit: int = 50) -> List[str]:
+    """Dockerfiles at any depth, not just the repo root.
+
+    Monorepos and service repos routinely keep them under docker/, deploy/ or
+    per-service subdirectories, so a root-only check reports 'no Dockerfile'
+    for repos that are fully containerised.
+    """
+    found: List[str] = []
+    listing = run(["git", "ls-files", "-z"], repo, 300)
+    if listing.ok:
+        for rel in listing.out.split("\0"):
+            rel = rel.strip()
+            if rel and re.search(r"(^|/)Dockerfile", rel, re.I):
+                found.append(rel)
+                if len(found) >= limit:
+                    break
+        return found
+    skip = {n.lower() for n in ALWAYS_SKIP_DIRS}
+    for root, dirs, files in os.walk(repo):
+        dirs[:] = [d for d in dirs if d.lower() not in skip]
+        for name in files:
+            if re.match(r"Dockerfile", name, re.I):
+                found.append((Path(root) / name).relative_to(repo).as_posix())
+                if len(found) >= limit:
+                    return found
+    return found
+
+
+def collect_build_test(repo: Path, mode: str, timeout: int,
+                       primary_language: str = "") -> Dict[str, Any]:
+    dockerfiles = find_dockerfiles(repo)
+    all_plans = detect_build_plans(repo)
+    plan = detect_build_plan(repo, primary_language)
+    row: Dict[str, Any] = {
+        "build_systems_detected": ",".join(p.system for p in all_plans),
+        "build_system": plan.system if plan else "unknown",
+        "build_command": plan.build_cmd if plan else "",
+        "test_command": plan.test_cmd if plan else "",
+        "runtime_version": plan.runtime if plan else "",
+        "runtime_version_source": plan.runtime_source if plan else "",
+        "container_image": plan.image if plan else "",
+        "dockerfile_present": bool(dockerfiles),
+        "dockerfile_count": len(dockerfiles),
+        "dockerfile_paths": ";".join(dockerfiles[:5]),
+        "ci_runs_tests": ci_runs_tests(repo),
+        "build_test_status": "Not verified",
+        "build_ok": "",
+        "test_ok": "",
+        "build_log_tail": "",
+        "build_check_mode": mode,
+    }
+    if mode == "docker" and plan:
+        try:
+            row.update(docker_build_test(repo, plan, timeout))
+        except Exception as exc:  # noqa: BLE001 - one repo must not kill the run
+            row["build_log_tail"] = f"{type(exc).__name__}: {exc}"
+    return row
+
+
 
 
 # ── per repo ─────────────────────────────────────────────────────────────────
@@ -283,13 +672,23 @@ def measure(spec: dict, scc_bin: str, out: Path, args: argparse.Namespace) -> di
         if not row["measured_branch"]:
             row["measured_branch"] = row["default_branch"]
         raw_by_lang, _ = run_scc(scc_bin, repo, args.scc_timeout)
-        clean_by_lang, clean_files = clean_scc(scc_bin, repo, args.scc_timeout)
+        authored_by_lang, clean_by_lang, clean_files = clean_scc(scc_bin, repo, args.scc_timeout)
         (out / "scc").mkdir(parents=True, exist_ok=True)
         (out / "scc" / f"{safe_name(spec['name'])}.json").write_text(
-            json.dumps({"raw_by_language": raw_by_lang, "clean_by_language": clean_by_lang}), encoding="utf-8")
-        row["raw_loc"] = sum(raw_by_lang.values())
+            json.dumps({"raw_by_language": raw_by_lang, "authored_by_language": authored_by_lang,
+                        "clean_by_language": clean_by_lang}), encoding="utf-8")
+        row["logical_loc"] = sum(raw_by_lang.values())
+        row["authored_loc"] = sum(authored_by_lang.values())
+        row["non_authored_loc"] = max(row["logical_loc"] - row["authored_loc"], 0)
         row["loc"], row["files"] = sum(clean_by_lang.values()), clean_files
         row["primary_language"], row["languages_breakdown"] = languages_breakdown(clean_by_lang)
+        if args.build_check != "none":
+            primary_authored = max(authored_by_lang.items(), key=lambda kv: kv[1])[0] if authored_by_lang else ""
+            bt = collect_build_test(repo, args.build_check, args.build_timeout, primary_authored)
+            for k in ("build_test_status", "build_system", "build_systems_detected", "build_command",
+                      "test_command", "runtime_version", "runtime_version_source", "ci_runs_tests",
+                      "dockerfile_present", "dockerfile_count"):
+                row[k] = bt.get(k, "")
     except Exception as exc:  # noqa: BLE001 - a bad repo is recorded, never fatal
         row["status"], row["error"] = "error", " ".join(str(exc).split())[-300:]
     finally:
@@ -300,7 +699,7 @@ def measure(spec: dict, scc_bin: str, out: Path, args: argparse.Namespace) -> di
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="LOC measured the way codebase-profiler does it.")
+    ap = argparse.ArgumentParser(description="repo-analysis v2: authored LOC on the profiler branch rule, plus build/test status.")
     ap.add_argument("--repos", required=True, help="repo list (txt/csv/json/jsonl)")
     ap.add_argument("--out", required=True, help="output directory")
     ap.add_argument("--workers", type=int, default=4)
@@ -309,6 +708,10 @@ def main() -> int:
                     help="latest (profiler default): newest-commit branch; default: the platform default branch")
     ap.add_argument("--local-latest-branch", action="store_true",
                     help="also move HEAD of local-path repos to the newest-commit branch (edits that checkout)")
+    ap.add_argument("--build-check", choices=["none", "detect", "docker"], default="detect",
+                    help="detect (default): identify build system, commands and runtime statically; "
+                         "docker: also try a real build and test run in a container; none: skip")
+    ap.add_argument("--build-timeout", type=int, default=1800, help="seconds per docker build/test step")
     ap.add_argument("--scc-timeout", type=int, default=600)
     ap.add_argument("--clone-timeout", type=int, default=3600)
     ap.add_argument("--tmp-dir", default="", help="where temporary clones go (default: system temp)")
@@ -316,6 +719,9 @@ def main() -> int:
     args = ap.parse_args()
 
     scc_bin = find_scc()
+    if args.build_check == "docker" and not docker_available():
+        log("docker daemon unreachable: downgrading --build-check to detect")
+        args.build_check = "detect"
     if not scc_bin:
         print("ERROR: scc not found. Install it (https://github.com/boyter/scc) or set SCC_BIN.", file=sys.stderr)
         return 2
