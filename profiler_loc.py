@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
 """LOC for a list of git repos, measured the way codebase-profiler does it.
 
-The profiler's LOC rule, reproduced here:
+Measured the way codebase-profiler does it (full clone, newest-commit remote
+branch with ties going to the default branch, scc on the checkout), then
+cleaned so that only authored source code is counted:
 
-  1. Full clone (not blobless).
-  2. Check out the remote branch whose newest commit is most recent
-     (`for-each-ref --sort=-committerdate refs/remotes/origin/`); a tie goes
-     to the platform default branch.
-  3. `scc --format json <checkout>`; loc = sum of the Code column over all
-     languages. Nothing is excluded: vendored, generated and data files count,
-     exactly as in the profiler. scc itself skips .git and honours .gitignore.
-  Local-path repos are measured as checked out; --local-latest-branch moves
-  their HEAD like the profiler's EXTRACT_LOCAL_LATEST_BRANCH=1 (edits them).
+  * comments and blank lines: never counted (scc's Code column excludes them)
+  * vendored directories: vendor, node_modules, dist, build, generated,
+    migrations are skipped (--exclude-dir)
+  * generated and minified files: skipped (--no-gen --no-min-gen)
+  * data / markup languages: JSON, XML, YAML, TOML, CSV, Markdown, Plain Text,
+    HTML, CSS, SCSS/Sass/LESS, SVG, properties files, WSDL are dropped
 
-  4. primary_language and languages_breakdown come from the same scc Code
-     figures ("Python:61.2%; Shell:9.0%; ...").
+`loc` is that cleaned figure. `raw_loc` is the untouched profiler figure (sum
+of scc's Code column over everything) so the two can be compared.
+primary_language and languages_breakdown describe the cleaned code.
+Local-path repos are measured as checked out; --local-latest-branch moves their
+HEAD to the newest branch like the profiler does (this edits the checkout).
 
 Output (under --out): profiler_loc.csv, profiler_loc.jsonl, and
-scc/<repo>.json (the raw scc rows) for every repo. A failing repo gets
+scc/<repo>.json (per-language code lines, raw and cleaned) for every repo. A failing repo gets
 status=error and never stops the batch. Existing results are skipped unless
 --force.
 
@@ -52,10 +54,16 @@ from pathlib import Path
 from typing import Optional
 
 FIELDS = [
-    "repo", "platform", "measured_branch", "default_branch", "loc", "files",
+    "repo", "platform", "measured_branch", "default_branch", "loc", "raw_loc", "files",
     "primary_language", "languages_breakdown", "status", "error", "seconds",
 ]
 HOSTS = {"github": "github.com", "gitlab": "gitlab.com", "bitbucket": "bitbucket.org"}
+EXCLUDE_DIRS = ["vendor", "node_modules", "dist", "build", "generated", "migrations"]
+DATA_LANGUAGES = {
+    "JSON", "Plain Text", "XML", "Markdown", "CSV", "Text", "Properties File",
+    "SVG", "HTML", "CSS", "LESS", "Sass", "SCSS", "YAML", "TOML",
+    "Web Services Description Language",
+}
 _print_lock = threading.Lock()
 
 
@@ -200,20 +208,30 @@ def default_branch_of(repo: Path) -> str:
 
 # ── scc ──────────────────────────────────────────────────────────────────────
 
-def run_scc(scc_bin: str, repo: Path, timeout: int) -> dict:
-    r = subprocess.run([scc_bin, "--format", "json", str(repo)], capture_output=True, text=True, timeout=timeout)
+def run_scc(scc_bin: str, repo: Path, timeout: int, extra: tuple = ()) -> tuple[dict[str, int], dict[str, int]]:
+    """Return ({language: code lines}, {language: file count})."""
+    r = subprocess.run([scc_bin, "--format", "json", *extra, str(repo)],
+                       capture_output=True, text=True, timeout=timeout)
     if r.returncode != 0:
         raise RuntimeError((r.stderr or r.stdout or "scc failed")[-400:])
     data = json.loads(r.stdout or "[]")
     by_lang: dict[str, int] = {}
-    loc = files = 0
+    files_by_lang: dict[str, int] = {}
     for row in data if isinstance(data, list) else []:
         name = row.get("Name") or row.get("name") or "Unknown"
-        code = int(row.get("Code") or row.get("code") or 0)
-        by_lang[name] = by_lang.get(name, 0) + code
-        loc += code
-        files += int(row.get("Count") or 0)
-    return {"loc": loc, "files": files, "by_language": by_lang, "raw": data}
+        by_lang[name] = by_lang.get(name, 0) + int(row.get("Code") or row.get("code") or 0)
+        files_by_lang[name] = files_by_lang.get(name, 0) + int(row.get("Count") or 0)
+    return by_lang, files_by_lang
+
+
+def clean_scc(scc_bin: str, repo: Path, timeout: int) -> tuple[dict[str, int], int]:
+    """Authored source only: no vendored dirs, generated/minified files or data languages."""
+    extra = ["--no-gen", "--no-min-gen"]
+    for d in EXCLUDE_DIRS:
+        extra += ["--exclude-dir", d]
+    by_lang, files_by_lang = run_scc(scc_bin, repo, timeout, tuple(extra))
+    code = {k: v for k, v in by_lang.items() if k not in DATA_LANGUAGES and v > 0}
+    return code, sum(files_by_lang.get(k, 0) for k in code)
 
 
 def languages_breakdown(by_language: dict[str, int]) -> tuple[str, str]:
@@ -264,11 +282,14 @@ def measure(spec: dict, scc_bin: str, out: Path, args: argparse.Namespace) -> di
             row["measured_branch"] = select_latest_branch(repo, row["default_branch"], local)
         if not row["measured_branch"]:
             row["measured_branch"] = row["default_branch"]
-        scc = run_scc(scc_bin, repo, args.scc_timeout)
+        raw_by_lang, _ = run_scc(scc_bin, repo, args.scc_timeout)
+        clean_by_lang, clean_files = clean_scc(scc_bin, repo, args.scc_timeout)
         (out / "scc").mkdir(parents=True, exist_ok=True)
-        (out / "scc" / f"{safe_name(spec['name'])}.json").write_text(json.dumps(scc), encoding="utf-8")
-        row["loc"], row["files"] = scc["loc"], scc["files"]
-        row["primary_language"], row["languages_breakdown"] = languages_breakdown(scc["by_language"])
+        (out / "scc" / f"{safe_name(spec['name'])}.json").write_text(
+            json.dumps({"raw_by_language": raw_by_lang, "clean_by_language": clean_by_lang}), encoding="utf-8")
+        row["raw_loc"] = sum(raw_by_lang.values())
+        row["loc"], row["files"] = sum(clean_by_lang.values()), clean_files
+        row["primary_language"], row["languages_breakdown"] = languages_breakdown(clean_by_lang)
     except Exception as exc:  # noqa: BLE001 - a bad repo is recorded, never fatal
         row["status"], row["error"] = "error", " ".join(str(exc).split())[-300:]
     finally:
